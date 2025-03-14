@@ -4,6 +4,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import csv
 import torch.multiprocessing as mp
+from torch.nn.utils.rnn import pad_sequence
+import matplotlib.pyplot as plt
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
@@ -13,7 +16,7 @@ csvFiles = ["Dataset - English to French.csv", "Dataset - French to English.csv"
 SOS_token = 0
 EOS_token = 1
 max_length = 100 # Must be 100?
-hidden_size = 256
+hidden_size = 128
 learning_rate = 0.01
 n_epochs = 41
 batch_size = 1 # Must be 1?
@@ -21,17 +24,17 @@ attention = [False, True]
 
 class SynonymDataset(Dataset):
     """Custom Dataset class for handling synonym pairs."""
-    def __init__(self, dataset, char_to_index):
+    def __init__(self, dataset, word_to_index):
         self.dataset = dataset
-        self.char_to_index = char_to_index
+        self.word_to_index = word_to_index
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        input_word, target_word = self.dataset[idx]
-        input_tensor = torch.tensor([self.char_to_index[char] for char in input_word] + [EOS_token], dtype=torch.long)
-        target_tensor = torch.tensor([self.char_to_index[char] for char in target_word] + [EOS_token], dtype=torch.long)
+        input_sentence, target_sentence = self.dataset[idx]
+        input_tensor = torch.tensor([self.word_to_index[word] for word in input_sentence.split()] + [EOS_token], dtype=torch.long)
+        target_tensor = torch.tensor([self.word_to_index[word] for word in target_sentence.split()] + [EOS_token], dtype=torch.long)
         return input_tensor, target_tensor
     
 class Encoder(nn.Module):
@@ -43,9 +46,12 @@ class Encoder(nn.Module):
         self.GRU = nn.GRU(hidden_size, hidden_size)
 
     def forward(self, input, hidden):
-        embedded = self.embedding(input).view(1, 1, -1)
+        embedded = self.embedding(input).view(-1, 1, self.hidden_size)  # Ensure correct shape
         output, hidden = self.GRU(embedded, hidden)
         return output, hidden
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=device)
 
     def initHidden(self):
         return (torch.zeros(1, 1, self.hidden_size, device=device))
@@ -61,7 +67,7 @@ class Decoder(nn.Module):
         self.softmax = nn.LogSoftmax(dim=1)
                              
     def forward(self, input, hidden):
-        embedded = self.embedding(input).view(1, 1, -1)
+        embedded = self.embedding(input).view(-1, 1, self.hidden_size)
         output, hidden = self.GRU(embedded, hidden)
         output = self.softmax(self.out(output[0]))
         return output, hidden
@@ -86,7 +92,7 @@ class AttnDecoder(nn.Module):
         self.out = nn.Linear(self.hidden_size, output_size)
 
     def forward(self, input, hidden, encoder_outputs):
-        embedded = self.embedding(input).view(1, 1, -1)
+        embedded = self.embedding(input).view(-1, 1, self.hidden_size)
         embedded = self.dropout(embedded)
 
         attn_weights = torch.softmax(
@@ -107,37 +113,41 @@ class AttnDecoder(nn.Module):
     def initHidden(self):
         return (torch.zeros(1, 1, self.hidden_size, device=device))
 
-def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, char_to_index, attention, max_length = 100):
+def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, word_to_index, attention, max_length=100):
+    encoder.train()  # Set encoder to training mode
+    decoder.train()  # Set decoder to training mode
+
     encoder_hidden = encoder.initHidden()
 
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
 
-    input_length = input_tensor.size(0)
-    target_length = target_tensor.size(0)
+    input_length = input_tensor.size(1)
+    target_length = target_tensor.size(1)
 
     encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device).to(device)
 
     loss = 0
 
     for ei in range(input_length):
-        encoder_output, encoder_hidden = encoder(input_tensor[ei].unsqueeze(0), encoder_hidden)
+        encoder_output, encoder_hidden = encoder(input_tensor[:, ei].unsqueeze(0), encoder_hidden)
         encoder_outputs[ei] = encoder_output[0, 0]
 
-    decoder_input = torch.tensor([[char_to_index['SOS']]], device=device).to(device)
+    decoder_input = torch.tensor([[word_to_index['SOS']]], device=device).to(device)
 
     decoder_hidden = encoder_hidden
 
     for di in range(target_length):
-        if attention: decoder_output, decoder_hidden, decoder_attention = decoder(
-            decoder_input, decoder_hidden, encoder_outputs)
-        else: decoder_output, decoder_hidden = decoder(
-            decoder_input, decoder_hidden)
+        if attention:
+            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+        else:
+            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+
         topv, topi = decoder_output.topk(1)
         decoder_input = topi.squeeze().detach()
 
-        loss += criterion(decoder_output, target_tensor[di].unsqueeze(0))
-        if decoder_input.item() == char_to_index['EOS']:
+        loss += criterion(decoder_output, target_tensor[:, di])
+        if decoder_input.item() == word_to_index['EOS']:
             break
 
     loss.backward()
@@ -147,29 +157,30 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
 
     return loss.item() / target_length
 
-def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, index_to_char, attention, n_examples=5):
+def evaluate(encoder, decoder, dataloader, criterion, index_to_word, attention):
     encoder.eval()
     decoder.eval()
     
     total_loss = 0
     correct_predictions = 0
+    total_predictions = 0
     
     with torch.no_grad():
-        for i, (input_tensor, target_tensor) in enumerate(dataloader):
-            input_tensor = input_tensor[0].to(device)
-            target_tensor = target_tensor[0].to(device)
+        for input_tensor, target_tensor in dataloader:
+            input_tensor = input_tensor.to(device)
+            target_tensor = target_tensor.to(device)
             
             encoder_hidden = encoder.initHidden()
 
-            input_length = input_tensor.size(0)
-            target_length = target_tensor.size(0)
+            input_length = input_tensor.size(1)
+            target_length = target_tensor.size(1)
 
             encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device).to(device)
 
             loss = 0
 
             for ei in range(input_length):
-                encoder_output, encoder_hidden = encoder(input_tensor[ei].unsqueeze(0), encoder_hidden)
+                encoder_output, encoder_hidden = encoder(input_tensor[:, ei].unsqueeze(0), encoder_hidden)
                 encoder_outputs[ei] = encoder_output[0, 0]
 
             decoder_input = torch.tensor([[SOS_token]], device=device)
@@ -178,63 +189,169 @@ def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, index_to
             predicted_indices = []
 
             for di in range(target_length):
-                if attention: decoder_output, decoder_hidden, decoder_attention = decoder(
-                    decoder_input, decoder_hidden, encoder_outputs)
-                else: decoder_output, decoder_hidden = decoder(
-                    decoder_input, decoder_hidden)
+                if attention:
+                    decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+                else:
+                    decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
                 topv, topi = decoder_output.topk(1)
                 predicted_indices.append(topi.item())
                 decoder_input = topi.squeeze().detach()
 
-                loss += criterion(decoder_output, target_tensor[di].unsqueeze(0))
+                loss += criterion(decoder_output, target_tensor[:, di])
                 if decoder_input.item() == EOS_token:
                     break
 
             total_loss += loss.item() / target_length
-            if predicted_indices == target_tensor.tolist():
+
+            # Compare predicted_indices with target_tensor
+            target_indices = target_tensor.squeeze().tolist()
+            if predicted_indices == target_indices:
                 correct_predictions += 1
+            total_predictions += 1
+
+    average_loss = total_loss / len(dataloader)
+    accuracy = correct_predictions / total_predictions
+    return average_loss, accuracy
+
+def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, index_to_word, attention, n_examples=5):
+    encoder.eval()
+    decoder.eval()
+    
+    total_loss = 0
+    correct_predictions = 0
+    total_predictions = 0
+    
+    with torch.no_grad():
+        for i, (input_tensor, target_tensor) in enumerate(dataloader):
+            input_tensor = input_tensor.to(device)
+            target_tensor = target_tensor.to(device)
+            
+            encoder_hidden = encoder.initHidden()
+
+            input_length = input_tensor.size(1)
+            target_length = target_tensor.size(1)
+
+            encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device).to(device)
+
+            loss = 0
+
+            for ei in range(input_length):
+                encoder_output, encoder_hidden = encoder(input_tensor[:, ei].unsqueeze(0), encoder_hidden)
+                encoder_outputs[ei] = encoder_output[0, 0]
+
+            decoder_input = torch.tensor([[SOS_token]], device=device)
+            decoder_hidden = encoder_hidden
+
+            predicted_indices = []
+
+            for di in range(target_length):
+                if attention:
+                    decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+                else:
+                    decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+                topv, topi = decoder_output.topk(1)
+                predicted_indices.append(topi.item())
+                decoder_input = topi.squeeze().detach()
+
+                loss += criterion(decoder_output, target_tensor[:, di])
+                if decoder_input.item() == EOS_token:
+                    break
+
+            total_loss += loss.item() / target_length
+
+            # Compare predicted_indices with target_tensor
+            target_indices = target_tensor.squeeze().tolist()
+            if predicted_indices == target_indices:
+                correct_predictions += 1
+            total_predictions += 1
 
             if i < n_examples:
-                predicted_string = ''.join([index_to_char[index] for index in predicted_indices if index not in (SOS_token, EOS_token)])
-                target_string = ''.join([index_to_char[index.item()] for index in target_tensor if index.item() not in (SOS_token, EOS_token)])
-                input_string = ''.join([index_to_char[index.item()] for index in input_tensor if index.item() not in (SOS_token, EOS_token)])
+                predicted_string = ' '.join([index_to_word[index] for index in predicted_indices if index not in (SOS_token, EOS_token)])
+                target_string = ' '.join([index_to_word[index.item()] for index in target_tensor[0] if index.item() not in (SOS_token, EOS_token)])
+                input_string = ' '.join([index_to_word[index.item()] for index in input_tensor[0] if index.item() not in (SOS_token, EOS_token)])
                 
                 print(f'Input: {input_string}, Target: {target_string}, Predicted: {predicted_string}')
         
         average_loss = total_loss / len(dataloader)
-        accuracy = correct_predictions / len(dataloader)
+        accuracy = correct_predictions / total_predictions
         print(f'Evaluation Loss: {average_loss}, Accuracy: {accuracy}')
         
 def train_model(fileName, hidden_size, learning_rate, n_epochs, batch_size, SOS_token, EOS_token, attention, max_length):
 
-    with open (fileName, encoding="utf-8") as file:
+    with open(fileName, encoding="utf-8") as file:
         reader = csv.reader(file)
         Dataset = [tuple(row) for row in reader]
+
+    words = set(word for pair in Dataset for sentence in pair for word in sentence.split())
+    word_to_index = {"SOS": SOS_token, "EOS": EOS_token, **{word: i+2 for i, word in enumerate(sorted(words))}}
+    index_to_word = {i: word for word, i in word_to_index.items()}
     
-    char_to_index = {"SOS": SOS_token, "EOS": EOS_token, **{char: i+2 for i, char in enumerate(sorted(list(set(''.join([word for pair in Dataset for word in pair])))))}}
-    index_to_char = {i: char for char, i in char_to_index.items()}
-    synonym_dataset = SynonymDataset(Dataset, char_to_index)
-    dataloader = DataLoader(synonym_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-    encoder = Encoder(input_size = len(char_to_index), hidden_size=hidden_size).to(device)
-    if attention: decoder = AttnDecoder(hidden_size=hidden_size, output_size = len(char_to_index), max_length = max_length).to(device)
-    else: decoder = Decoder(hidden_size=hidden_size, output_size = len(char_to_index)).to(device)
+    synonym_dataset = SynonymDataset(Dataset, word_to_index)
+    dataloader = DataLoader(synonym_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    
+    encoder = Encoder(input_size=len(word_to_index), hidden_size=hidden_size).to(device)
+    if attention:
+        decoder = AttnDecoder(hidden_size=hidden_size, output_size=len(word_to_index), max_length=max_length).to(device)
+    else:
+        decoder = Decoder(hidden_size=hidden_size, output_size=len(word_to_index)).to(device)
+    
     encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
     decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
     criterion = nn.NLLLoss()
 
+    training_losses = []
+    validation_losses = []
+    validation_accuracies = []
+
     for epoch in range(n_epochs):
         total_loss = 0
         for input_tensor, target_tensor in dataloader:
-            input_tensor = input_tensor[0].to(device)
-            target_tensor = target_tensor[0].to(device)
+            input_tensor = input_tensor.to(device)
+            target_tensor = target_tensor.to(device)
             
-            loss = train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, char_to_index, attention)
+            loss = train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, word_to_index, attention)
             total_loss += loss
         
-        if epoch % 10 == 0:
-            print(f'Epoch {epoch}, Loss: {total_loss / len(dataloader)}')
+        training_loss = total_loss / len(dataloader)
+        training_losses.append(training_loss)
 
-    evaluate_and_show_examples(encoder, decoder, dataloader, criterion, index_to_char, attention)
+        if epoch % 10 == 0:
+            val_loss, val_accuracy = evaluate(encoder, decoder, dataloader, criterion, index_to_word, attention)
+            validation_losses.append(val_loss)
+            validation_accuracies.append(val_accuracy)
+            print(f'Epoch {epoch}, Training Loss: {training_loss}, Validation Loss: {val_loss}, Validation Accuracy: {val_accuracy}')
+
+    evaluate_and_show_examples(encoder, decoder, dataloader, criterion, index_to_word, attention)
+
+    epochs = range(0, n_epochs, 10)
+    plt.figure()
+    plt.plot(epochs, training_losses[::10], label='Training Loss')
+    plt.plot(epochs, validation_losses, label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+    if attention:
+        plt.savefig(f'{fileName}_loss_with_attention.png')
+    else:
+        plt.savefig(f'{fileName}_loss_without_attention.png')
+
+    plt.figure()
+    plt.plot(epochs, validation_accuracies, label='Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Validation Accuracy')
+    if attention:
+        plt.savefig(f'{fileName}_accuracy_with_attention.png')
+    else:
+        plt.savefig(f'{fileName}_accuracy_without_attention.png')
+
+def collate_fn(batch):
+    input_tensors, target_tensors = zip(*batch)
+    input_tensors = pad_sequence(input_tensors, batch_first=True, padding_value=EOS_token)
+    target_tensors = pad_sequence(target_tensors, batch_first=True, padding_value=EOS_token)
+    return input_tensors, target_tensors
 
 if __name__ == '__main__':
     for i in csvFiles:
