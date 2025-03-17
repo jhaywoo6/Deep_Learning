@@ -16,13 +16,14 @@ csvFiles = ["Dataset - English to French.csv", "Dataset - French to English.csv"
 SOS_token = 0
 EOS_token = 1
 max_length = 100 # Must be 100?
-hidden_size = 128
-learning_rate = 0.01
-n_epochs = 41
+hidden_size = 128 # Adjustable
+learning_rate = 0.01 # Adjustable
+n_epochs = 41 # Adjustable
 batch_size = 1 # Must be 1?
-attention = [False, True]
+num_layers = 1 # Adjustable
+attention = [False, True] # Adjustable
 
-class SynonymDataset(Dataset):
+class VocabularyWeights(Dataset):
     """Custom Dataset class for handling synonym pairs."""
     def __init__(self, dataset, word_to_index):
         self.dataset = dataset
@@ -43,7 +44,7 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
         self.hidden_size = hidden_size
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.GRU = nn.GRU(hidden_size, hidden_size)
+        self.GRU = nn.GRU(hidden_size, hidden_size, num_layers = num_layers)
 
     def forward(self, input, hidden):
         embedded = self.embedding(input).view(-1, 1, self.hidden_size)  # Ensure correct shape
@@ -54,7 +55,7 @@ class Encoder(nn.Module):
         return torch.zeros(1, 1, self.hidden_size, device=device)
 
     def initHidden(self):
-        return (torch.zeros(1, 1, self.hidden_size, device=device))
+        return (torch.zeros(num_layers, 1, self.hidden_size, device=device))
     
 class Decoder(nn.Module):
     """The Decoder part of the seq2seq model."""
@@ -62,7 +63,7 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
         self.hidden_size = hidden_size
         self.embedding = nn.Embedding(output_size, hidden_size)
-        self.GRU = nn.GRU(hidden_size, hidden_size)
+        self.GRU = nn.GRU(hidden_size, hidden_size, num_layers = num_layers)
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=1)
                              
@@ -73,7 +74,7 @@ class Decoder(nn.Module):
         return output, hidden
 
     def initHidden(self):
-        return (torch.zeros(1, 1, self.hidden_size, device=device))
+        return (torch.zeros(num_layers, 1, self.hidden_size, device=device))
     
 class AttnDecoder(nn.Module):
     """Decoder with attention mechanism."""
@@ -88,7 +89,7 @@ class AttnDecoder(nn.Module):
         self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
         self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
         self.dropout = nn.Dropout(self.dropout_p)
-        self.GRU = nn.GRU(self.hidden_size, self.hidden_size)
+        self.GRU = nn.GRU(self.hidden_size, self.hidden_size, num_layers=num_layers)
         self.out = nn.Linear(self.hidden_size, output_size)
 
     def forward(self, input, hidden, encoder_outputs):
@@ -111,7 +112,7 @@ class AttnDecoder(nn.Module):
         return output, hidden, attn_weights
 
     def initHidden(self):
-        return (torch.zeros(1, 1, self.hidden_size, device=device))
+        return (torch.zeros(num_layers, 1, self.hidden_size, device=device))
 
 def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, word_to_index, attention, max_length=100):
     encoder.train()  # Set encoder to training mode
@@ -286,8 +287,8 @@ def train_model(fileName, hidden_size, learning_rate, n_epochs, batch_size, SOS_
     word_to_index = {"SOS": SOS_token, "EOS": EOS_token, **{word: i+2 for i, word in enumerate(sorted(words))}}
     index_to_word = {i: word for word, i in word_to_index.items()}
     
-    synonym_dataset = SynonymDataset(Dataset, word_to_index)
-    dataloader = DataLoader(synonym_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    vocabulary_weights = VocabularyWeights(Dataset, word_to_index)
+    dataloader = DataLoader(vocabulary_weights, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     
     encoder = Encoder(input_size=len(word_to_index), hidden_size=hidden_size).to(device)
     if attention:
