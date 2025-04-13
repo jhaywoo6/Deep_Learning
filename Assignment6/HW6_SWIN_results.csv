@@ -1,0 +1,4 @@
+Model,Average Time (s),Num Parameters,FLOPs,Accuracy (%)
+Tiny,110.23,27596254,1.3967E+11,0.5511
+Small,161.82,48914158,2.73078E+11,0.5949
+Scratch,261.24,18918736,1.39559E+11,0.0491
